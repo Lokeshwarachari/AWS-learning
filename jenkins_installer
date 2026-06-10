@@ -1,0 +1,1414 @@
+import sys
+import subprocess
+import time
+import os
+import glob
+import json
+import webbrowser
+import getpass
+import urllib.request
+import urllib.parse
+import urllib.error
+import logging
+from botocore.exceptions import ClientError
+
+
+# ─────────────────────────────────────────────
+#   STEP 0 : Auto-install missing dependencies
+# ─────────────────────────────────────────────
+
+REQUIRED = {"boto3": "boto3", "paramiko": "paramiko", "requests": "requests"}
+
+
+def ensure_dependencies():
+    missing = []
+    for module, package in REQUIRED.items():
+        try:
+            __import__(module)
+        except ImportError:
+            missing.append(package)
+
+    if not missing:
+        return
+
+    print("\n[Setup] Missing packages detected:", ", ".join(missing))
+    print("[Setup] Installing automatically...\n")
+
+    try:
+        subprocess.check_call(
+            [sys.executable, "-m", "pip", "install", "--quiet"] + missing
+        )
+        print("[Setup] Packages installed.\n")
+        print("[Setup] Please re-run the script to continue.\n")
+        sys.exit(0)
+    except subprocess.CalledProcessError:
+        print("[Error] Auto-install failed. Run manually:")
+        print(f"        pip install {' '.join(missing)}\n")
+        sys.exit(1)
+
+
+ensure_dependencies()
+
+import boto3
+import paramiko
+import requests
+
+
+# ─────────────────────────────────────────────
+#   LOGGING
+# ─────────────────────────────────────────────
+
+LOG_FILE = "jenkins_install.log"
+
+logging.basicConfig(
+    level=logging.DEBUG,
+    format="%(asctime)s  %(levelname)-8s  %(message)s",
+    handlers=[
+        logging.FileHandler(LOG_FILE, encoding="utf-8"),
+    ],
+)
+log = logging.getLogger("jenkins")
+
+
+def log_print(msg, level="info"):
+    """Print to console AND write to log file."""
+    print(msg)
+    getattr(log, level)(msg)
+
+
+# ─────────────────────────────────────────────
+#   HELPERS
+# ─────────────────────────────────────────────
+
+def header(title):
+    width = 50
+    line = "=" * width
+    log_print(f"\n{line}\n  {title}\n{line}\n")
+
+
+def step(n, total, label):
+    log_print(f"\n[{n}/{total}] {label}...")
+
+
+def confirm(prompt="Continue?", default="y"):
+    hint = "[Y/n]" if default.lower() == "y" else "[y/N]"
+    answer = input(f"\n{prompt} {hint}: ").strip().lower()
+    if answer == "":
+        return default.lower() == "y"
+    return answer == "y"
+
+
+# ─────────────────────────────────────────────
+#   LAST INSTALL — SAVE & LOAD
+# ─────────────────────────────────────────────
+
+LAST_INSTALL_FILE = "last_install.json"
+
+
+def save_last_install(selected, ssh_user=None, pem_file=None, os_family=None,
+                      jenkins_version=None, install_duration=None):
+    data = {
+        "instance_id":      selected["id"],
+        "name":             selected["name"],
+        "ip":               selected["ip"],
+        "key_pair":         selected["key_pair"],
+        "ami":              selected["ami"],
+        "region":           selected["region"],
+        "ssh_user":         ssh_user,
+        "pem_file":         pem_file,
+        "os_family":        os_family,
+        "jenkins_version":  jenkins_version,
+        "install_duration": install_duration,
+        "timestamp":        time.strftime("%Y-%m-%d %H:%M:%S"),
+    }
+    with open(LAST_INSTALL_FILE, "w") as f:
+        json.dump(data, f, indent=2)
+    log_print(f"[Saved]  Instance info written to: {os.path.abspath(LAST_INSTALL_FILE)}")
+
+
+def load_last_install():
+    """Return the saved install dict, or None if not found / unreadable."""
+    if not os.path.isfile(LAST_INSTALL_FILE):
+        return None
+    try:
+        with open(LAST_INSTALL_FILE) as f:
+            return json.load(f)
+    except Exception as e:
+        log.warning(f"Could not read {LAST_INSTALL_FILE}: {e}")
+        return None
+
+
+# ─────────────────────────────────────────────
+#   REFRESH IP FROM AWS
+# ─────────────────────────────────────────────
+
+def refresh_instance_ip(instance_id, region=None):
+    """
+    Look up the current public IP for the given instance ID from AWS.
+    Uses the saved region so reconnect works correctly even when the
+    user has changed their default AWS region since the original install.
+    """
+    try:
+        ec2 = boto3.client("ec2", region_name=region)
+        resp = ec2.describe_instances(InstanceIds=[instance_id])
+        reservations = resp.get("Reservations", [])
+        if not reservations:
+            log_print(f"[Info] Instance {instance_id} not found in AWS.", "warning")
+            return None
+        inst = reservations[0]["Instances"][0]
+        state = inst["State"]["Name"]
+        if state != "running":
+            log_print(f"[Info] Instance is '{state}', not running.", "warning")
+            return None
+        ip = inst.get("PublicIpAddress")
+        if not ip:
+            log_print("[Info] Instance has no public IP (stopped/EIP detached?).", "warning")
+            return None
+        return ip
+    except Exception as e:
+        log_print(f"[Info] Could not refresh IP from AWS: {e}", "warning")
+        return None
+
+
+# ─────────────────────────────────────────────
+#   UNIFIED INSTANCE SELECTION  (V4.7)
+# ─────────────────────────────────────────────
+
+def select_instance_unified():
+    """
+    Show all running Linux instances in a single numbered list.
+    The instance from last_install.json (if still running) is tagged
+    "(Last Used)" and pre-selected as the default choice so the user
+    can just press Enter.
+
+    Returns (selected_instance_dict, last_install_dict_or_None).
+    last_install_dict is non-None only when the user picked the last-used
+    instance, so the caller knows to reuse the saved PEM / SSH user.
+    """
+    last    = load_last_install()
+    last_id = last.get("instance_id") if last else None
+
+    instances = get_running_instances()
+    if not instances:
+        log_print("\nNo running Linux instances found.")
+        return None, None
+
+    # Silently refresh IP for the last-used instance if it is still running
+    if last_id:
+        for inst in instances:
+            if inst["id"] == last_id:
+                current_ip = refresh_instance_ip(last_id, region=last.get("region"))
+                if current_ip and current_ip != last.get("ip"):
+                    log_print(
+                        f"[Info]  IP updated for last-used instance: "
+                        f"{last['ip']} -> {current_ip}"
+                    )
+                    last["ip"] = current_ip
+                    with open(LAST_INSTALL_FILE, "w") as f:
+                        json.dump(last, f, indent=2)
+                break
+
+    print("\nRunning Instances:\n")
+    default_idx = None
+    for i, inst in enumerate(instances, start=1):
+        tag = "  (Last Used)" if inst["id"] == last_id else ""
+        ip_display = inst["ip"]
+        if ip_display == "N/A":
+            ip_display = "N/A  - No public IP, SSH will fail"
+        jv = last.get("jenkins_version") if (last and inst["id"] == last_id) else None
+        ts = last.get("timestamp")       if (last and inst["id"] == last_id) else None
+        print(f"  {i}. {inst['name']}{tag}")
+        print(f"     Instance ID     : {inst['id']}")
+        print(f"     Public IP       : {ip_display}")
+        print(f"     Key Pair        : {inst['key_pair']}")
+        print(f"     AMI             : {inst['ami']}")
+        print(f"     Security Groups : {inst['sgs']}")
+        print(f"     Region          : {inst['region']}")
+        if jv:
+            print(f"     Jenkins         : {jv}")
+        if ts:
+            print(f"     Last Install    : {ts}")
+        print()
+        if inst["id"] == last_id:
+            default_idx = i
+
+    hint = f" [{default_idx}]" if default_idx else ""
+    choice = input(f"Select Instance Number{hint}: ").strip()
+
+    if choice == "" and default_idx is not None:
+        choice = str(default_idx)
+
+    if not choice.isdigit():
+        return None, None
+    idx = int(choice) - 1
+    if idx < 0 or idx >= len(instances):
+        return None, None
+
+    selected     = instances[idx]
+    matched_last = last if (last and selected["id"] == last_id) else None
+    return selected, matched_last
+
+
+# ─────────────────────────────────────────────
+#   AWS CONNECTIVITY CHECK
+# ─────────────────────────────────────────────
+
+def check_aws():
+    log_print("[Check] Verifying AWS credentials...")
+    try:
+        sts = boto3.client("sts")
+        identity = sts.get_caller_identity()
+        log_print(f"[Check] Connected as: {identity['Arn']}")
+        region = boto3.session.Session().region_name or "unknown"
+        log_print(f"[Check] Using AWS Region: {region}")
+        return True
+    except Exception as e:
+        log_print("\n[Error] AWS not configured or credentials invalid.", "error")
+        log_print("        Run:  aws configure\n", "error")
+        return False
+
+
+# ─────────────────────────────────────────────
+#   PEM FILE DETECTION
+# ─────────────────────────────────────────────
+
+def validate_pem_file(path):
+    if not os.path.isfile(path):
+        return False, "File not found."
+    if not path.lower().endswith(".pem"):
+        return False, "File does not have a .pem extension."
+    try:
+        paramiko.RSAKey.from_private_key_file(path)
+        return True, ""
+    except paramiko.ssh_exception.PasswordRequiredException:
+        return True, ""
+    except Exception as e:
+        for key_class in (paramiko.Ed25519Key, paramiko.ECDSAKey, paramiko.DSSKey):
+            try:
+                key_class.from_private_key_file(path)
+                return True, ""
+            except Exception:
+                pass
+        return False, f"Not a valid SSH private key: {e}"
+
+
+def find_pem_for_instance(key_pair_name):
+    search_dirs = [
+        ".",
+        os.path.expanduser("~"),
+        os.path.expanduser("~/.ssh"),
+        os.path.expanduser("~/Downloads"),
+        os.path.expanduser("~/Desktop"),
+        os.path.expanduser("~/Documents"),
+    ]
+    for directory in search_dirs:
+        candidate = os.path.join(directory, f"{key_pair_name}.pem")
+        if os.path.isfile(candidate):
+            return candidate
+    return None
+
+
+def find_all_pem_files():
+    search_patterns = [
+        "./*.pem",
+        os.path.expanduser("~/*.pem"),
+        os.path.expanduser("~/.ssh/*.pem"),
+        os.path.expanduser("~/Downloads/*.pem"),
+        os.path.expanduser("~/Desktop/*.pem"),
+        os.path.expanduser("~/Documents/*.pem"),
+    ]
+    found = []
+    seen = set()
+    for pattern in search_patterns:
+        for path in glob.glob(pattern):
+            abs_path = os.path.abspath(path)
+            if abs_path not in seen:
+                found.append(abs_path)
+                seen.add(abs_path)
+    return found
+
+
+def select_pem_file(key_pair_name):
+    auto = find_pem_for_instance(key_pair_name)
+    if auto:
+        ok, reason = validate_pem_file(auto)
+        if ok:
+            log_print(f"[PEM]  Auto-detected: {auto}")
+            return auto
+        else:
+            log_print(f"[PEM]  Auto-detected '{auto}' but failed validation: {reason}")
+
+    log_print(f"[PEM]  Could not auto-detect '{key_pair_name}.pem'")
+    all_pems = find_all_pem_files()
+
+    while True:
+        if all_pems:
+            print("\nAvailable PEM Files:\n")
+            for i, pem in enumerate(all_pems, start=1):
+                print(f"  {i}. {os.path.basename(pem)}")
+                print(f"     {pem}\n")
+        else:
+            print("\n  No .pem files found in common locations.\n")
+
+        print(f"  {len(all_pems) + 1}. Search another folder")
+        print(f"  {len(all_pems) + 2}. Enter full PEM path manually\n")
+
+        choice = input("Select option: ").strip()
+        if not choice.isdigit():
+            continue
+
+        idx = int(choice) - 1
+
+        if 0 <= idx < len(all_pems):
+            chosen = all_pems[idx]
+            ok, reason = validate_pem_file(chosen)
+            if ok:
+                log.info(f"PEM selected: {chosen}")
+                return chosen
+            print(f"  [Invalid PEM] {reason}")
+            continue
+
+        if idx == len(all_pems):
+            folder = input("\nEnter folder path to search: ").strip()
+            folder = os.path.expanduser(folder)
+            if os.path.isdir(folder):
+                new_pems = glob.glob(os.path.join(folder, "**", "*.pem"), recursive=True)
+                added = 0
+                for p in new_pems:
+                    abs_p = os.path.abspath(p)
+                    if abs_p not in all_pems:
+                        all_pems.append(abs_p)
+                        added += 1
+                print(f"  No new .pem files found under: {folder}" if not added
+                      else f"  Found {added} new .pem file(s).")
+            else:
+                print("  Folder not found.")
+            continue
+
+        if idx == len(all_pems) + 1:
+            manual = input("\nEnter full path to your .pem file: ").strip()
+            manual = os.path.expanduser(manual)
+            ok, reason = validate_pem_file(manual)
+            if ok:
+                log.info(f"PEM selected (manual): {manual}")
+                return manual
+            print(f"  [Invalid PEM] {reason}")
+            continue
+
+
+# ─────────────────────────────────────────────
+#   DETECT SSH USER FROM AMI
+# ─────────────────────────────────────────────
+
+def detect_ssh_user(instance):
+    image_id = instance.get("image_id", "")
+    try:
+        # AMI IDs are region-specific — use the instance's own region
+        ec2 = boto3.client("ec2", region_name=instance.get("region"))
+        ami_info = ec2.describe_images(ImageIds=[image_id])
+        ami_name = ami_info["Images"][0].get("Name", "").lower() if ami_info["Images"] else ""
+    except Exception:
+        ami_name = ""
+
+    if "ubuntu" in ami_name:  return "ubuntu"
+    if "debian" in ami_name:  return "debian"
+    if "centos" in ami_name:  return "centos"
+    if "fedora" in ami_name:  return "fedora"
+    if "rhel" in ami_name or "red hat" in ami_name: return "ec2-user"
+    if "suse" in ami_name or "sles" in ami_name:    return "ec2-user"
+    return "ec2-user"
+
+
+# ─────────────────────────────────────────────
+#   DETECT OS FAMILY OVER SSH
+# ─────────────────────────────────────────────
+
+def detect_os_family(ssh):
+    stdin, stdout, stderr = ssh.exec_command(
+        "cat /etc/os-release 2>/dev/null || echo 'ID=unknown'"
+    )
+    content = stdout.read().decode().lower()
+    log.debug(f"os-release: {content[:200]}")
+    if any(x in content for x in ("ubuntu", "debian")):
+        return "debian"
+    return "rhel"
+
+
+# ─────────────────────────────────────────────
+#   PORT CHECKS
+# ─────────────────────────────────────────────
+
+def check_port(ip, port, timeout=5):
+    import socket
+    try:
+        with socket.create_connection((ip, port), timeout=timeout):
+            return True
+    except OSError:
+        return False
+
+
+def wait_for_ssh(ip, wait_seconds=60, interval=5):
+    """
+    Poll port 22 until it opens or the timeout expires.
+    Returns True when SSH is ready, False if it never opened.
+    Replaces the old hard-fail when the instance is still booting.
+    """
+    log_print(f"[SSH]  Waiting for port 22 on {ip} (up to {wait_seconds}s)...")
+    deadline = time.time() + wait_seconds
+    attempt  = 0
+    while time.time() < deadline:
+        attempt += 1
+        if check_port(ip, 22, timeout=5):
+            log_print(f"[SSH]  Port 22 is open. ✓")
+            return True
+        remaining = int(deadline - time.time())
+        print(f"         Waiting for SSH... {remaining}s remaining", end="\r")
+        time.sleep(interval)
+    print()  # clear the \r line
+    log_print("\n[Error] Port 22 did not open within the timeout.", "error")
+    log_print("        - Security Group has no inbound SSH rule (port 22)", "error")
+    log_print("        - Instance is still booting — try again in 30s", "error")
+    log_print("        - A firewall or VPC ACL is blocking port 22\n", "error")
+    return False
+
+
+# ─────────────────────────────────────────────
+#   SSH WITH FALLBACK USERS
+# ─────────────────────────────────────────────
+
+SSH_FALLBACK_USERS = ["ec2-user", "ubuntu", "admin", "debian", "centos", "fedora", "root"]
+
+
+def ssh_connect_with_fallback(ip, pem_file, preferred_user=None):
+    order = [preferred_user] + [u for u in SSH_FALLBACK_USERS if u != preferred_user]
+    last_error = None
+
+    for user in order:
+        if not user:
+            continue
+        try:
+            print(f"[SSH]  Trying user '{user}'...", end=" ", flush=True)
+            ssh = paramiko.SSHClient()
+            ssh.set_missing_host_key_policy(paramiko.AutoAddPolicy())
+            ssh.connect(hostname=ip, username=user, key_filename=pem_file, timeout=10)
+            print("OK")
+            log_print(f"[SSH]  Connected as '{user}'.")
+            return ssh, user
+        except Exception as e:
+            print("failed")
+            log.debug(f"SSH user '{user}' failed: {e}")
+            last_error = e
+
+    log_print("\n[Error] SSH connection failed for all users.\n", "error")
+    log_print("  1. Wrong PEM file — double-check the key pair matches this instance", "error")
+    log_print("  2. Port 22 blocked — add an inbound SSH rule in the Security Group", "error")
+    log_print("  3. No Public IP — assign an Elastic IP or enable auto-assign", "error")
+    log_print("  4. Instance not fully started — wait 30s and try again", "error")
+    log_print(f"  5. Last error: {last_error}\n", "error")
+    raise ConnectionError("SSH failed on all users") from last_error
+
+
+def run_command(ssh, command, label=None):
+    if label:
+        print(f"       → {label}")
+        log.debug(f"CMD [{label}]: {command}")
+    else:
+        print(f"\n>>> {command}")
+        log.debug(f"CMD: {command}")
+
+    stdin, stdout, stderr = ssh.exec_command(command)
+    exit_status = stdout.channel.recv_exit_status()
+    output = stdout.read().decode()
+    error  = stderr.read().decode()
+
+    if output:
+        print(output, end="")
+        log.debug(f"STDOUT: {output[:500]}")
+    if error:
+        print(error, end="")
+        log.debug(f"STDERR: {error[:500]}")
+
+    return exit_status
+
+
+# ─────────────────────────────────────────────
+#   EC2 INSTANCE LISTING
+# ─────────────────────────────────────────────
+
+def get_instance_details(inst):
+    name = "No Name"
+    for tag in inst.get("Tags", []):
+        if tag["Key"] == "Name":
+            name = tag["Value"]
+    sgs = [sg["GroupId"] for sg in inst.get("SecurityGroups", [])]
+    return {
+        "id":       inst["InstanceId"],
+        "name":     name,
+        "ip":       inst.get("PublicIpAddress", "N/A"),
+        "key_pair": inst.get("KeyName", "Unknown"),
+        "image_id": inst.get("ImageId", ""),
+        "platform": inst.get("Platform", ""),
+        "ami":      inst.get("ImageId", "N/A"),
+        "region":   boto3.session.Session().region_name or "unknown",
+        "sgs":      ", ".join(sgs) if sgs else "N/A",
+    }
+
+
+def get_running_instances():
+    ec2 = boto3.client("ec2")
+    response = ec2.describe_instances()
+    instances = []
+    skipped_windows = 0
+
+    for reservation in response["Reservations"]:
+        for inst in reservation["Instances"]:
+            if inst["State"]["Name"] != "running":
+                continue
+            if inst.get("Platform", "").lower() == "windows":
+                skipped_windows += 1
+                continue
+            instances.append(get_instance_details(inst))
+
+    if skipped_windows:
+        log_print(f"[Info]  Skipped {skipped_windows} Windows instance(s) — SSH not supported.")
+    return instances
+
+
+# ─────────────────────────────────────────────
+#   PUBLIC IP GUARD
+# ─────────────────────────────────────────────
+
+def check_public_ip(selected):
+    if selected["ip"] == "N/A":
+        log_print("\n[Error] This instance has no Public IP address.", "error")
+        log_print("        SSH cannot connect to 'N/A'.\n", "error")
+        log_print("  1. Allocate an Elastic IP and associate it with this instance.", "error")
+        log_print("  2. Or stop the instance, enable 'Auto-assign public IP', restart.\n", "error")
+        return False
+    return True
+
+
+# ─────────────────────────────────────────────
+#   SECURITY GROUP — YOUR IP ONLY
+# ─────────────────────────────────────────────
+
+def get_my_public_ip():
+    try:
+        ip = urllib.request.urlopen(
+            "https://checkip.amazonaws.com", timeout=5
+        ).read().decode().strip()
+        return f"{ip}/32"
+    except Exception:
+        return None
+
+
+def open_jenkins_port(instance_id):
+    ec2 = boto3.client("ec2")
+    response = ec2.describe_instances(InstanceIds=[instance_id])
+    security_groups = response["Reservations"][0]["Instances"][0]["SecurityGroups"]
+
+    my_cidr = get_my_public_ip()
+    if my_cidr:
+        cidr       = my_cidr
+        cidr_label = f"your IP only ({my_cidr})"
+    else:
+        cidr       = "0.0.0.0/0"
+        cidr_label = "all IPs (0.0.0.0/0) — could not detect your IP"
+
+    for sg in security_groups:
+        sg_id = sg["GroupId"]
+        sg_detail = ec2.describe_security_groups(GroupIds=[sg_id])
+        existing_rules = sg_detail["SecurityGroups"][0].get("IpPermissions", [])
+        already_open = False
+        for rule in existing_rules:
+            if rule.get("FromPort") == 8080 and rule.get("ToPort") == 8080:
+                for ip_range in rule.get("IpRanges", []):
+                    if ip_range.get("CidrIp") == cidr:
+                        already_open = True
+                        break
+            if already_open:
+                break
+
+        if already_open:
+            log_print(f"[Port]  8080 already open for {cidr} on {sg_id} — skipping")
+            continue
+
+        try:
+            ec2.authorize_security_group_ingress(
+                GroupId=sg_id,
+                IpProtocol="tcp",
+                FromPort=8080,
+                ToPort=8080,
+                CidrIp=cidr
+            )
+            log_print(f"[Port]  Opened 8080 on {sg_id} → {cidr_label}")
+        except ClientError as e:
+            if "InvalidPermission.Duplicate" in str(e):
+                log_print(f"[Port]  8080 already open on {sg_id} — skipping")
+            else:
+                raise
+
+
+# ─────────────────────────────────────────────
+#   SAFE RE-RUN CHECKS
+# ─────────────────────────────────────────────
+
+def check_swap(ssh):
+    stdin, stdout, stderr = ssh.exec_command("swapon --show")
+    return bool(stdout.read().decode().strip())
+
+
+def check_java(ssh):
+    stdin, stdout, stderr = ssh.exec_command("java -version 2>&1")
+    output = stdout.read().decode() + stderr.read().decode()
+    import re
+    return bool(re.search(r'\b21[\.\b]', output) or ' 21 ' in output
+                or output.strip().startswith('21')
+                or '"21.' in output or '"21"' in output)
+
+
+def check_jenkins_installed(ssh):
+    stdin, stdout, stderr = ssh.exec_command(
+        "rpm -q jenkins 2>/dev/null || dpkg -l jenkins 2>/dev/null | grep -q '^ii'"
+    )
+    out = stdout.read().decode().strip()
+    return out.startswith("jenkins") or stdout.channel.recv_exit_status() == 0
+
+
+def check_jenkins_running(ssh):
+    stdin, stdout, stderr = ssh.exec_command(
+        "sudo systemctl is-active jenkins 2>/dev/null"
+    )
+    return stdout.read().decode().strip() == "active"
+
+
+# ─────────────────────────────────────────────
+#   GET JENKINS VERSION
+# ─────────────────────────────────────────────
+
+def get_jenkins_version(ssh):
+    for cmd in (
+        "rpm -q --queryformat '%{VERSION}' jenkins 2>/dev/null",
+        "dpkg-query -W -f='${Version}' jenkins 2>/dev/null",
+    ):
+        stdin, stdout, stderr = ssh.exec_command(cmd)
+        version = stdout.read().decode().strip()
+        if version and "not installed" not in version:
+            return version
+    return None
+
+
+# ─────────────────────────────────────────────
+#   JENKINS HEALTH CHECK  (V4.8 — 300s timeout)
+# ─────────────────────────────────────────────
+
+def jenkins_health_check(ip, timeout=300):
+    """
+    Two-stage health check:
+      Stage 1 — /login returns 200  (Jenkins HTTP is up)
+      Stage 2 — /api/json returns 200  (Jenkins fully initialised)
+
+    Returns (healthy: bool, jenkins_version: str | None).
+    """
+    print("\n  Jenkins first startup usually takes 1-3 minutes.")
+    print("  Please wait...\n")
+
+    deadline = time.time() + timeout
+
+    # Stage 1: wait for /login
+    login_url = f"http://{ip}:8080/login"
+    log_print(f"[Health] Stage 1 — waiting for {login_url}...")
+    while time.time() < deadline:
+        try:
+            resp = requests.get(login_url, timeout=5)
+            if resp.status_code == 200:
+                log_print("[Health] Stage 1 passed — login page is up. ✓")
+                break
+        except requests.exceptions.ConnectionError:
+            pass
+        elapsed = int(deadline - time.time())
+        print(f"         Jenkins is still starting... {elapsed}s remaining", end="\r")
+        time.sleep(5)
+    else:
+        log_print("\n[Health] Jenkins did not respond within the timeout.", "warning")
+        return False, None
+
+    # Stage 2: wait for /api/json — also capture X-Jenkins header for version
+    api_url = f"http://{ip}:8080/api/json"
+    log_print(f"[Health] Stage 2 — waiting for {api_url}...")
+    while time.time() < deadline:
+        try:
+            resp = requests.get(api_url, timeout=5)
+            if resp.status_code == 200:
+                version = resp.headers.get("X-Jenkins")
+                if version:
+                    log_print(f"[Health] Stage 2 passed — Jenkins {version} is ready. ✓")
+                else:
+                    log_print("[Health] Stage 2 passed — Jenkins API is ready. ✓")
+                return True, version
+            log.debug(f"[Health] /api/json returned {resp.status_code}")
+        except requests.exceptions.ConnectionError:
+            pass
+        elapsed = int(deadline - time.time())
+        print(f"         Jenkins is still starting... {elapsed}s remaining", end="\r")
+        time.sleep(5)
+
+    log_print("\n[Health] Jenkins API did not become ready within the timeout.", "warning")
+    return False, None
+
+
+# ─────────────────────────────────────────────
+#   JENKINS CREDENTIALS PROMPT
+# ─────────────────────────────────────────────
+
+def prompt_jenkins_credentials():
+    print("\n[Credentials] Set your Jenkins admin account:\n")
+    username = input("  Jenkins Username [admin]: ").strip()
+    if not username:
+        username = "admin"
+
+    while True:
+        password = getpass.getpass("  Jenkins Password: ")
+        if len(password) < 6:
+            print("  Password must be at least 6 characters.\n")
+            continue
+        confirm_pw = getpass.getpass("  Confirm Password: ")
+        if password != confirm_pw:
+            print("  Passwords do not match. Try again.\n")
+            continue
+        break
+
+    email = input("  Email Address: ").strip()
+    if not email:
+        email = f"{username}@example.com"
+
+    return {"username": username, "password": password, "email": email}
+
+
+# ─────────────────────────────────────────────
+#   AUTO-SETUP VIA SSH GROOVY FILES
+# ─────────────────────────────────────────────
+
+def _escape_groovy_string(s):
+    return (
+        s
+        .replace("\\", "\\\\")
+        .replace('"',  '\\"')
+        .replace("$",  "\\$")
+        .replace("\n", "\\n")
+        .replace("\r", "\\r")
+    )
+
+
+def auto_setup_jenkins_via_ssh(ssh, ip, init_password, creds):
+    log_print("\n[Auto-Setup] Writing Jenkins initialisation scripts...")
+
+    safe_username = _escape_groovy_string(creds["username"])
+    safe_password = _escape_groovy_string(creds["password"])
+
+    wizard_script = """\
+import jenkins.model.*
+import jenkins.install.InstallState
+Jenkins.instance.setInstallState(InstallState.INITIAL_SETUP_COMPLETED)
+Jenkins.instance.save()
+println "[init] Setup wizard disabled."
+"""
+
+    user_script = f"""\
+import jenkins.model.*
+import hudson.security.*
+
+def instance = Jenkins.instance
+def realm = new HudsonPrivateSecurityRealm(false)
+
+try {{
+    realm.loadUserByUsername("{safe_username}")
+    println "[init] User '{safe_username}' already exists — skipping creation."
+}} catch (Exception e) {{
+    realm.createAccount("{safe_username}", "{safe_password}")
+    println "[init] Admin user created: {safe_username}"
+}}
+
+instance.setSecurityRealm(realm)
+
+def strategy = new FullControlOnceLoggedInAuthorizationStrategy()
+strategy.setAllowAnonymousRead(false)
+instance.setAuthorizationStrategy(strategy)
+instance.save()
+"""
+
+    init_dir = "/var/lib/jenkins/init.groovy.d"
+    run_command(ssh, f"sudo mkdir -p {init_dir}", label="Creating init.groovy.d")
+
+    for filename, content in [
+        ("01-disable-wizard.groovy", wizard_script),
+        ("02-create-admin.groovy",   user_script),
+    ]:
+        path = f"{init_dir}/{filename}"
+        b64 = __import__("base64").b64encode(content.encode()).decode()
+        run_command(
+            ssh,
+            f"echo '{b64}' | base64 -d | sudo tee {path} > /dev/null",
+            label=f"Writing {filename}",
+        )
+
+    run_command(
+        ssh,
+        f"sudo chown -R jenkins:jenkins {init_dir}",
+        label="Setting Jenkins ownership on init.groovy.d",
+    )
+    run_command(
+        ssh,
+        f"sudo chmod 644 {init_dir}/*.groovy",
+        label="Setting permissions on Groovy scripts (644)",
+    )
+
+    log_print("\n[Auto-Setup] Restarting Jenkins to apply init scripts...")
+    run_command(ssh, "sudo systemctl restart jenkins")
+
+    log_print("[Auto-Setup] Waiting 20 seconds for Jenkins restart to begin...")
+    time.sleep(20)
+    log_print("[Auto-Setup] Init scripts will be removed after login is verified.")
+
+
+def verify_admin_login(ip, creds, timeout=600):
+    """
+    Poll /api/json with the new admin credentials.
+    600 s timeout — slow instances spend several minutes loading plugins
+    after a post-setup restart.
+    """
+    url = f"http://{ip}:8080/api/json"
+    log_print(f"\n[Verify] Testing admin login at {url}...")
+    deadline = time.time() + timeout
+    while time.time() < deadline:
+        try:
+            resp = requests.get(
+                url,
+                auth=(creds["username"], creds["password"]),
+                timeout=5,
+            )
+            if resp.status_code == 200:
+                log_print("[Verify] Admin login successful. ✓")
+                return True
+            log.debug(f"Login check returned {resp.status_code}")
+        except requests.exceptions.ConnectionError:
+            pass
+        elapsed = int(deadline - time.time())
+        print(f"         Jenkins is still starting... {elapsed}s remaining", end="\r")
+        time.sleep(5)
+    log_print("\n[Verify] Admin login did not succeed within timeout.", "warning")
+    return False
+
+
+# ─────────────────────────────────────────────
+#   SAVE CREDENTIALS FILE
+# ─────────────────────────────────────────────
+
+def save_credentials_file(ip, creds):
+    filename = "jenkins_credentials.txt"
+    sep = "=" * 55
+    content = (
+        f"{sep}\n"
+        f"  WARNING: PLAINTEXT CREDENTIALS\n"
+        f"  - Delete this file after use\n"
+        f"  - Do NOT upload to GitHub or any repository\n"
+        f"  - Add jenkins_credentials.txt to your .gitignore\n"
+        f"{sep}\n"
+        f"\nJenkins Credentials\n"
+        f"===================\n"
+        f"URL      : http://{ip}:8080\n"
+        f"Username : {creds['username']}\n"
+        f"Password : {creds['password']}\n"
+        f"Email    : {creds['email']}\n"
+        f"\nSaved on : {time.strftime('%Y-%m-%d %H:%M:%S')}\n"
+    )
+    with open(filename, "w") as f:
+        f.write(content)
+    try:
+        os.chmod(filename, 0o600)
+    except Exception:
+        pass
+    log_print(f"[Saved]  Credentials written to: {os.path.abspath(filename)} (mode 600)")
+
+
+# ─────────────────────────────────────────────
+#   BROWSER OPEN WITH FALLBACK
+# ─────────────────────────────────────────────
+
+def open_browser(url):
+    try:
+        opened = webbrowser.open(url)
+    except Exception:
+        opened = False
+    if opened:
+        log_print(f"[Browser] Browser launched. If it didn't open, go to:")
+    else:
+        log_print(f"[Browser] Could not open browser automatically. Go to:")
+    log_print(f"          {url}")
+
+
+# ─────────────────────────────────────────────
+#   EXISTING JENKINS MENU  (V4.8 — status option added)
+# ─────────────────────────────────────────────
+
+def get_jenkins_password(ssh):
+    stdin, stdout, stderr = ssh.exec_command(
+        "sudo cat /var/lib/jenkins/secrets/initialAdminPassword 2>/dev/null"
+    )
+    password = stdout.read().decode().strip()
+    return password if password else "Password file not found."
+
+
+def existing_jenkins_menu(ssh, ip):
+    running = check_jenkins_running(ssh)
+    status  = "running" if running else "stopped"
+
+    log_print(f"\n[Info]  Jenkins is already installed on this instance ({status}).\n")
+    print("  ┌─────────────────────────────────────────┐")
+    print("  │    Existing Jenkins Installation Found  │")
+    print("  └─────────────────────────────────────────┘\n")
+    print("  1. Open Jenkins")
+    print("  2. Show Initial Admin Password  (only valid before first-time setup)")
+    print("  3. Restart Jenkins Service")
+    print("  4. Reinstall Jenkins  (deletes all data)")
+    print("  5. Show Jenkins Status")
+    print("  6. Exit\n")
+
+    choice = input("Select Option: ").strip()
+
+    if choice == "1":
+        if not running:
+            log_print(
+                "[Warning] Jenkins is currently stopped. "
+                "The browser will show 'Connection refused'.",
+                "warning",
+            )
+            if not confirm("Open browser anyway?", default="n"):
+                return False
+        open_browser(f"http://{ip}:8080")
+
+    elif choice == "2":
+        password = get_jenkins_password(ssh)
+        print(f"\nInitial Admin Password (only valid before first-time setup):\n{password}")
+
+    elif choice == "3":
+        if running:
+            log_print("\n[Service] Restarting Jenkins (currently running)...")
+            run_command(ssh, "sudo systemctl restart jenkins")
+        else:
+            log_print("\n[Service] Starting Jenkins (currently stopped)...")
+            run_command(ssh, "sudo systemctl start jenkins")
+        time.sleep(5)
+        if check_jenkins_running(ssh):
+            action = "Restart" if running else "Start"
+            log_print(f"[Service] {action} successful. Jenkins is active. ✓")
+        else:
+            log_print("[Service] Command may have failed — Jenkins is not active.", "warning")
+            log_print("          Run:  sudo systemctl status jenkins  to investigate.", "warning")
+
+    elif choice == "4":
+        print("\n[Warning] Reinstall will permanently delete:")
+        print("          - All Jenkins jobs and pipelines")
+        print("          - All credentials and plugins")
+        print("          - All build history")
+        print("          This cannot be undone.\n")
+        if confirm("Are you sure you want to reinstall?", default="n"):
+            log_print("\n[Reinstall] Stopping Jenkins...")
+            run_command(ssh, "sudo systemctl stop jenkins || true")
+            log_print("[Reinstall] Removing Jenkins package...")
+            run_command(ssh, "sudo yum remove jenkins -y 2>/dev/null || sudo apt-get remove jenkins -y 2>/dev/null")
+            log_print("[Reinstall] Deleting Jenkins data and leftover init scripts...")
+            run_command(ssh, "sudo rm -rf /var/lib/jenkins")
+            run_command(ssh, "sudo rm -rf /var/lib/jenkins/init.groovy.d")
+            run_command(ssh, "sudo rm -f /etc/yum.repos.d/jenkins.repo")
+            run_command(ssh, "sudo rm -f /etc/apt/sources.list.d/jenkins.list 2>/dev/null || true")
+            log_print("[Reinstall] Cleanup complete. Proceeding with fresh install...\n")
+            return True
+        else:
+            print("Reinstall cancelled.")
+
+    elif choice == "5":
+        log_print("\n[Status] Jenkins service status:\n")
+        run_command(ssh, "sudo systemctl status jenkins --no-pager")
+
+    elif choice == "6":
+        print("\nExiting.")
+
+    return False
+
+
+# ─────────────────────────────────────────────
+#   INSTALLATION  (OS-aware)
+# ─────────────────────────────────────────────
+
+def install_jenkins(ssh, os_family):
+    TOTAL_STEPS = 8
+    if os_family == "debian":
+        _install_jenkins_debian(ssh, TOTAL_STEPS)
+    else:
+        _install_jenkins_rhel(ssh, TOTAL_STEPS)
+
+
+def _install_jenkins_rhel(ssh, TOTAL_STEPS):
+    step(1, TOTAL_STEPS, "Updating packages (yum)")
+    run_command(ssh, "sudo yum update -y")
+
+    step(2, TOTAL_STEPS, "Configuring swap memory")
+    if check_swap(ssh):
+        print("       Swap already configured — skipping")
+    else:
+        run_command(ssh, "sudo dd if=/dev/zero of=/swapfile bs=128M count=16")
+        run_command(ssh, "sudo chmod 600 /swapfile")
+        run_command(ssh, "sudo mkswap /swapfile")
+        run_command(ssh, "sudo swapon /swapfile")
+        run_command(ssh,
+            "grep -q '/swapfile' /etc/fstab || "
+            "echo '/swapfile swap swap defaults 0 0' | sudo tee -a /etc/fstab"
+        )
+        print("       Swap created (2 GB)")
+
+    step(3, TOTAL_STEPS, "Installing Java 21 (Amazon Corretto)")
+    if check_java(ssh):
+        print("       Java 21 already installed — skipping")
+    else:
+        run_command(ssh, "sudo rpm --import https://yum.corretto.aws/corretto.key")
+        run_command(ssh,
+            "sudo curl -L -o /etc/yum.repos.d/corretto.repo "
+            "https://yum.corretto.aws/corretto.repo"
+        )
+        run_command(ssh,
+            "sudo yum install java-21-amazon-corretto-devel -y "
+            "--enablerepo='AmazonCorretto'"
+        )
+
+    stdin, stdout, stderr = ssh.exec_command("java -version 2>&1")
+    print(f"       {stdout.read().decode().strip().split(chr(10))[0]}")
+
+    step(4, TOTAL_STEPS, "Installing fonts (Jenkins UI fix)")
+    run_command(ssh, "sudo yum install -y fontconfig dejavu-sans-fonts")
+    run_command(ssh, "sudo fc-cache -fv")
+
+    step(5, TOTAL_STEPS, "Adding Jenkins repository")
+    run_command(ssh,
+        "sudo wget -q -O /etc/yum.repos.d/jenkins.repo "
+        "https://pkg.jenkins.io/redhat-stable/jenkins.repo"
+    )
+    run_command(ssh,
+        "sudo rpm --import https://pkg.jenkins.io/redhat-stable/jenkins.io-2023.key"
+    )
+
+    step(6, TOTAL_STEPS, "Installing Jenkins")
+    run_command(ssh, "sudo yum install jenkins -y")
+
+    _start_and_wait(ssh, TOTAL_STEPS)
+
+
+def _install_jenkins_debian(ssh, TOTAL_STEPS):
+    step(1, TOTAL_STEPS, "Updating packages (apt)")
+    run_command(ssh, "sudo apt-get update -y")
+    run_command(ssh, "sudo apt-get upgrade -y")
+
+    step(2, TOTAL_STEPS, "Configuring swap memory")
+    if check_swap(ssh):
+        print("       Swap already configured — skipping")
+    else:
+        run_command(ssh, "sudo dd if=/dev/zero of=/swapfile bs=128M count=16")
+        run_command(ssh, "sudo chmod 600 /swapfile")
+        run_command(ssh, "sudo mkswap /swapfile")
+        run_command(ssh, "sudo swapon /swapfile")
+        run_command(ssh,
+            "grep -q '/swapfile' /etc/fstab || "
+            "echo '/swapfile swap swap defaults 0 0' | sudo tee -a /etc/fstab"
+        )
+        print("       Swap created (2 GB)")
+
+    step(3, TOTAL_STEPS, "Installing Java 21 (OpenJDK)")
+    if check_java(ssh):
+        print("       Java 21 already installed — skipping")
+    else:
+        run_command(ssh, "sudo apt-get install -y openjdk-21-jdk")
+
+    stdin, stdout, stderr = ssh.exec_command("java -version 2>&1")
+    print(f"       {stdout.read().decode().strip().split(chr(10))[0]}")
+
+    step(4, TOTAL_STEPS, "Installing fonts (Jenkins UI fix)")
+    run_command(ssh, "sudo apt-get install -y fontconfig fonts-dejavu")
+    run_command(ssh, "sudo fc-cache -fv")
+
+    step(5, TOTAL_STEPS, "Adding Jenkins repository")
+    run_command(ssh, "sudo apt-get install -y curl gnupg2")
+    run_command(ssh,
+        "curl -fsSL https://pkg.jenkins.io/debian-stable/jenkins.io-2023.key "
+        "| sudo tee /usr/share/keyrings/jenkins-keyring.asc > /dev/null"
+    )
+    run_command(ssh,
+        "echo 'deb [signed-by=/usr/share/keyrings/jenkins-keyring.asc] "
+        "https://pkg.jenkins.io/debian-stable binary/' "
+        "| sudo tee /etc/apt/sources.list.d/jenkins.list > /dev/null"
+    )
+    run_command(ssh, "sudo apt-get update -y")
+
+    step(6, TOTAL_STEPS, "Installing Jenkins")
+    run_command(ssh, "sudo apt-get install -y jenkins")
+
+    _start_and_wait(ssh, TOTAL_STEPS)
+
+
+def _start_and_wait(ssh, TOTAL_STEPS):
+    step(7, TOTAL_STEPS, "Enabling and starting Jenkins service")
+    run_command(ssh, "sudo systemctl enable jenkins")
+    run_command(ssh, "sudo systemctl restart jenkins")
+
+    step(8, TOTAL_STEPS, "Waiting for Jenkins to initialize")
+    initialized = False
+    for i in range(24):
+        stdin, stdout, stderr = ssh.exec_command(
+            "sudo test -f /var/lib/jenkins/secrets/initialAdminPassword && echo READY"
+        )
+        if stdout.read().decode().strip() == "READY":
+            print("       Jenkins initialized successfully.")
+            initialized = True
+            break
+        print(f"       Waiting... {(i + 1) * 5}s", end="\r")
+        time.sleep(5)
+
+    if not initialized:
+        print("\n[Warning] Jenkins may still be starting. Check manually.")
+
+    print()
+    run_command(ssh, "sudo systemctl status jenkins --no-pager")
+
+
+# ─────────────────────────────────────────────
+#   SUCCESS SCREEN  (V4.7)
+# ─────────────────────────────────────────────
+
+def print_success_screen(ip, creds, final_version, login_ok, install_duration=None):
+    url = f"http://{ip}:8080"
+    width = 50
+    line = "=" * width
+
+    print(f"\n{line}")
+    print(f"{'JENKINS READY':^{width}}")
+    print(f"{line}\n")
+    print(f"  URL")
+    print(f"  {url}\n")
+    print(f"  USERNAME")
+    print(f"  {creds['username']}\n")
+    print(f"  PASSWORD")
+    print(f"  {creds['password']}\n")
+    if final_version:
+        print(f"  VERSION")
+        print(f"  {final_version}\n")
+    if install_duration:
+        print(f"  INSTALL TIME")
+        print(f"  {install_duration}\n")
+    print(f"{line}")
+    print(f"  Copy these credentials and login.")
+    print(f"{line}\n")
+
+    if login_ok:
+        print("  Status : Admin account created and verified. ✓")
+    else:
+        print("  Status : Setup applied. Jenkins may still be initialising.")
+        print("           Use the credentials above when the login page appears.")
+
+    log_print(f"\n  Credentials File :  {os.path.abspath('jenkins_credentials.txt')}")
+    log_print(f"  Instance Info    :  {os.path.abspath(LAST_INSTALL_FILE)}")
+    log_print(f"  Install Log      :  {os.path.abspath(LOG_FILE)}\n")
+
+
+# ─────────────────────────────────────────────
+#   MAIN  (V4.8 — wait for SSH, install timer, URL shown early)
+# ─────────────────────────────────────────────
+
+def main():
+    header("Jenkins Installer V4.8 Final")
+
+    # 1. AWS check
+    if not check_aws():
+        return
+
+    # 2. Unified instance selection — no separate reconnect/fresh menu
+    selected, matched_last = select_instance_unified()
+    if not selected:
+        log_print("[Error] No instance selected. Exiting.", "error")
+        return
+
+    log_print(f"\n  Name            : {selected['name']}")
+    log_print(f"  Instance ID     : {selected['id']}")
+    log_print(f"  Public IP       : {selected['ip']}")
+    log_print(f"  AMI             : {selected['ami']}")
+    log_print(f"  Key Pair        : {selected['key_pair']}")
+    log_print(f"  Security Groups : {selected['sgs']}")
+    log_print(f"  Region          : {selected['region']}")
+
+    # 3. Public IP guard
+    if not check_public_ip(selected):
+        return
+
+    # 4. PEM file — reuse saved path if the user picked the last-used instance
+    pem_file = matched_last.get("pem_file") if matched_last else None
+    if pem_file and os.path.isfile(pem_file):
+        log_print(f"[PEM]  Using saved PEM: {pem_file}")
+    else:
+        if pem_file:
+            log_print(f"[PEM]  Saved PEM not found at '{pem_file}'. Please select it.")
+        pem_file = select_pem_file(selected["key_pair"])
+        if not pem_file:
+            log_print("\n[Error] No valid PEM file selected. Exiting.", "error")
+            return
+        # Persist updated PEM path
+        if matched_last:
+            matched_last["pem_file"] = pem_file
+            with open(LAST_INSTALL_FILE, "w") as f:
+                json.dump(matched_last, f, indent=2)
+            log_print(f"[PEM]  Updated PEM path saved to {LAST_INSTALL_FILE}.")
+
+    log_print(f"[PEM]  Using: {pem_file}")
+
+    # 5. SSH user — reuse saved user or detect from AMI
+    ssh_user_hint = (matched_last.get("ssh_user") if matched_last else None) \
+                    or detect_ssh_user(selected)
+    log_print(f"[SSH]  Preferred user: {ssh_user_hint}")
+
+    # 6. Confirm
+    if not confirm("Proceed?", default="y"):
+        print("\nAborted.")
+        return
+
+    # 7. Wait for port 22 — handles instances that are still booting
+    if not wait_for_ssh(selected["ip"], wait_seconds=60):
+        return
+
+    # ── Installation timer starts here ──
+    install_start = time.time()
+
+    # 8. SSH Connect
+    try:
+        ssh, ssh_user = ssh_connect_with_fallback(
+            selected["ip"], pem_file, preferred_user=ssh_user_hint
+        )
+    except ConnectionError:
+        return
+
+    # 9. Detect OS family
+    os_family = detect_os_family(ssh)
+    log_print(
+        f"[OS]   Detected: {os_family} "
+        f"({'Debian/Ubuntu' if os_family == 'debian' else 'RHEL/Amazon Linux/CentOS'})"
+    )
+
+    # 10. Existing Jenkins check — goes straight to menu
+    if check_jenkins_installed(ssh):
+        should_reinstall = existing_jenkins_menu(ssh, selected["ip"])
+        if not should_reinstall:
+            ssh.close()
+            return
+
+    # 11. Open Port 8080 + show URL early so user knows where to go
+    print()
+    open_jenkins_port(selected["id"])
+    url = f"http://{selected['ip']}:8080"
+    log_print(f"\n[Info]  Jenkins will be available at:")
+    log_print(f"        {url}\n")
+
+    # 12. Jenkins credentials
+    creds = prompt_jenkins_credentials()
+
+    # 13. Install
+    print()
+    install_jenkins(ssh, os_family)
+
+    # 14. Capture installed Jenkins version from package manager
+    jenkins_version = get_jenkins_version(ssh)
+    if jenkins_version:
+        log_print(f"[Jenkins] Installed version: {jenkins_version}")
+    else:
+        log_print("[Jenkins] Could not determine installed version from package manager.")
+
+    # 15. Retrieve initial admin password (log only)
+    init_password = get_jenkins_password(ssh)
+    log.info(f"Initial admin password on file (length={len(init_password)})")
+
+    # 16. Write Groovy init scripts, fix ownership/permissions, restart + sleep 20s
+    auto_setup_jenkins_via_ssh(ssh, selected["ip"], init_password, creds)
+
+    # 17. Close original SSH — systemctl restart dropped the session anyway
+    ssh.close()
+    log_print("[SSH]  Original connection closed.")
+
+    # 18. Two-stage health check (/login then /api/json) — also captures version
+    healthy, http_version = jenkins_health_check(selected["ip"])
+
+    # Prefer live HTTP header version; fall back to package manager version
+    final_version = http_version or jenkins_version
+
+    # 19. Verify admin login (10-minute timeout for slow instances)
+    login_ok = False
+    if healthy:
+        login_ok = verify_admin_login(selected["ip"], creds)
+
+    # 20. Port 8080 reachability confirmation
+    if healthy:
+        port_open = check_port(selected["ip"], 8080)
+        log_print(f"[Port]  8080 reachable: {'✓' if port_open else '✗ — check Security Group'}")
+
+    # 21. Remove init scripts only after login confirmed
+    if login_ok:
+        log_print("\n[Auto-Setup] Login verified — removing init scripts now...")
+        try:
+            ssh2, _ = ssh_connect_with_fallback(
+                selected["ip"], pem_file, preferred_user=ssh_user
+            )
+            init_dir = "/var/lib/jenkins/init.groovy.d"
+            run_command(
+                ssh2,
+                f"sudo rm -f {init_dir}/01-disable-wizard.groovy "
+                f"{init_dir}/02-create-admin.groovy",
+                label="Removing init.groovy.d scripts",
+            )
+            ssh2.close()
+            log_print("[Auto-Setup] Init scripts removed. ✓")
+        except Exception as e:
+            log_print(f"[Warning] Could not remove init scripts: {e}", "warning")
+            log_print("          Remove manually: sudo rm -f "
+                      "/var/lib/jenkins/init.groovy.d/0*.groovy", "warning")
+    elif healthy:
+        log_print("\n[Warning] Login not verified — init scripts left in place.", "warning")
+        log_print("          Remove manually once Jenkins is working:", "warning")
+        log_print("          sudo rm -f /var/lib/jenkins/init.groovy.d/0*.groovy", "warning")
+
+    if not healthy:
+        log_print("\n[Warning] Jenkins did not respond over HTTP.", "warning")
+        log_print(f"          Try opening  {url}  manually.", "warning")
+
+    # 22. Calculate install duration
+    elapsed_secs = int(time.time() - install_start)
+    install_duration = f"{elapsed_secs // 60}m {elapsed_secs % 60}s"
+    log_print(f"[Timer] Total install time: {install_duration}")
+
+    # 23. Save credentials + instance info (including version and duration)
+    save_credentials_file(selected["ip"], creds)
+    save_last_install(
+        selected,
+        ssh_user=ssh_user,
+        pem_file=pem_file,
+        os_family=os_family,
+        jenkins_version=final_version,
+        install_duration=install_duration,
+    )
+
+    # 24. Success screen
+    header("Jenkins Installation Complete")
+    print_success_screen(selected["ip"], creds, final_version, login_ok, install_duration)
+
+    # 25. Open browser
+    if confirm("Open Jenkins in browser now?", default="y"):
+        open_browser(url)
+
+    log_print("\nDone.\n")
+
+
+if __name__ == "__main__":
+    main()
